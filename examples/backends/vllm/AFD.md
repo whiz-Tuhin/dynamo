@@ -59,4 +59,35 @@ The synchronous connector exchanges activations at every remotely split layer. M
 
 Frontend, Attention, and FFN run in separate owned process groups with separate logs. The supervisor fails when any role exits, terminates every recorded role group, and does not signal the caller's process group. The FFN CLI port is a lifecycle input; do not use it as a request or readiness endpoint.
 
-After readiness, verify the logs show the AFD Attention and FFN worker classes and the AFD DeepSeek model wrapper. Then run deterministic reference/candidate/reference requests before collecting performance. A successful HTTP response alone does not prove correct AFD wiring.
+Preserve the resolved commands, compatibility checks, and role logs with each run. The explicit Attention worker initializes the AFD model runner and connector before HTTP readiness; the FFN startup marker confirms its connector loop. Then run deterministic reference/candidate/reference requests before collecting performance. A successful HTTP response alone does not prove correct AFD wiring.
+
+## Four-arm qualification launcher
+
+`afd_comparison.py` constructs one deployment at a time with exactly four GPUs:
+
+| Arm | Initial placement |
+| --- | --- |
+| `agg` | DP4/TP1 with expert parallelism |
+| `pd` | Two prefill workers and two decode workers |
+| `afd` | Two Attention GPUs and two FFN GPUs, DP1/TP2 per role |
+| `pd-afd` | Two prefill workers, one decode-Attention GPU, one FFN GPU |
+
+Inspect a plan without installing vLLM or starting processes:
+
+```bash
+PYTHONPATH=components/src python3 examples/backends/vllm/launch/afd_comparison.py \
+  --arm pd-afd --print-plan
+```
+
+In the pinned GPU environment, omit `--print-plan` and select a fresh log directory:
+
+```bash
+PYTHONPATH=components/src python3 examples/backends/vllm/launch/afd_comparison.py \
+  --arm pd-afd --log-dir /tmp/afd-comparison-run-1 --port-base 18000
+```
+
+Every arm records its commands and placement in `comparison-plan.json`. PD uses NIXL between prefill and decode; the FFN role has only its AFD connector. One supervisor owns all roles directly. The comparison uses local file discovery, TCP requests, ZMQ events, an isolated namespace, BF16, disabled prefix caching and eager execution.
+
+The PD default uses the same two prefill GPUs as PD+AFD, so that comparison changes only the decode-side split. `--pd-prefill-workers 1` also constructs a 1P3D candidate for baseline tuning. Comparison `--enable-dbo` is explicitly rejected until a native all-to-all backend is configured and qualified for every arm; the standalone AFD DBO switch remains a separate diagnostic experiment.
+
+These are initial qualification configurations, not tuned performance baselines. All four arms, particularly Dynamo PD+AFD, still require GPU correctness and transfer validation. Tune valid role allocations, batch sizes and supported execution modes with equal effort before drawing a performance conclusion. Unsupported configurations must remain visible failures.

@@ -160,7 +160,10 @@ def wait_until_ready(
                     if isinstance(item, dict)
                 }
                 if response.status == 200 and expected_model in model_ids:
-                    print(f"ready: {url} reports {expected_model}", flush=True)
+                    print(
+                        f"frontend registered: {url} reports {expected_model}",
+                        flush=True,
+                    )
                     return
         except (OSError, ValueError, urllib.error.URLError):
             pass
@@ -276,6 +279,7 @@ def main() -> int:
         "--dtype",
         "bfloat16",
         "--enable-expert-parallel",
+        "--no-enable-prefix-caching",
         "--max-num-seqs",
         str(max_seqs),
         "--max-num-batched-tokens",
@@ -408,6 +412,7 @@ def main() -> int:
             ready_timeout,
         )
         wait_for_ffn_daemon(supervisor)
+        print("ready: Dynamo Attention and AFD FFN connector loop", flush=True)
         return supervisor.wait()
     except KeyboardInterrupt:
         return 128 + (supervisor.signal_number or signal.SIGINT)
