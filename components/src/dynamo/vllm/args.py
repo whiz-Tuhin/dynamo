@@ -33,6 +33,7 @@ from dynamo.vllm.backend_args import DynamoVllmArgGroup, DynamoVllmConfig
 from dynamo.vllm.constants import DisaggregationMode
 
 from . import envs
+from .afd import validate_afd_sidecar_contract
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,11 @@ def cross_validate_config(
     dynamo_config: Config, engine_config: AsyncEngineArgs
 ) -> None:
     """Validate dynamo and engine config together. This should not modify the configs."""
+
+    validate_afd_sidecar_contract(
+        dynamo_config.disaggregation_mode,
+        engine_config.additional_config,
+    )
 
     if hasattr(engine_config, "stream_interval") and engine_config.stream_interval != 1:
         logger.info(
