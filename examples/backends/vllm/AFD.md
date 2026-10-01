@@ -25,7 +25,7 @@ The Dynamo revision is the last public commit before its vLLM runtime advanced t
 uv pip install -e '/path/to/afd-plugin[vllm]'
 ```
 
-The launcher verifies vLLM 0.26.0, the installed `afd` entry point, role topology, device allocation, and local ports before starting processes. It forces the AFD plugin, vLLM V1 runner, BF16, static expert parallelism, and the pinned model/tokenizer revision.
+The launcher verifies vLLM 0.26.0, the installed `afd` entry point and compatibility patches, role topology, device allocation, and local ports before starting processes. It forces the AFD plugin, vLLM V1 runner, BF16, static expert parallelism, and the pinned model/tokenizer revision.
 
 ## Run the four-GPU smoke
 
@@ -42,7 +42,7 @@ examples/backends/vllm/launch/afd.sh
 
 Override `AFD_ATTENTION_DEVICES`, `AFD_FFN_DEVICES`, and the corresponding `AFD_*_DP` and `AFD_*_TP` variables together. Device lists must be unique and nonoverlapping, their lengths must equal DP times TP, and this connector requires at least as many Attention ranks as FFN ranks.
 
-The launcher creates a unique `DYN_NAMESPACE` unless one is supplied. It reports readiness only when that namespace's frontend lists the expected model. It writes `frontend.log`, `attention.log`, `ffn.log`, and `launch.json` under `AFD_LOG_DIR`. The manifest contains the installed package identity, imported plugin path, model revision, resolved commands, device mapping, namespace, and ports.
+The launcher creates a unique `DYN_NAMESPACE` unless one is supplied. Empty namespaces and the global namespace `dynamo` are rejected. It reports readiness only when that namespace's frontend lists the expected model and the FFN engine acknowledges that its connector loop started. Both AFD roles receive explicit worker classes; a plugin import failure cannot silently substitute a native vLLM worker. It writes `frontend.log`, `attention.log`, `ffn.log`, and `launch.json` under `AFD_LOG_DIR`. The manifest contains the installed package identity, imported plugin path, model revision, resolved commands, device mapping, namespace, and ports.
 
 For the single-node smoke, discovery defaults to a local file store under the log directory, requests use TCP, and events use ZMQ. This avoids requiring a separate etcd or NATS deployment. Explicit `DYN_DISCOVERY_BACKEND`, `DYN_REQUEST_PLANE`, `DYN_EVENT_PLANE` and `DYN_FILE_KV` settings are honored and recorded; supply their dependencies when overriding. Inherited namespace prefixes, worker suffixes and explicit endpoint identities are cleared so they cannot redirect this standalone launch into another deployment.
 

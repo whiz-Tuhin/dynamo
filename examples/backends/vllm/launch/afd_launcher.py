@@ -88,6 +88,33 @@ def preflight() -> dict[str, object]:
             "vLLM plugin entry point 'afd = afd_plugin:register_afd' is missing"
         )
     plugin_module = importlib.import_module("afd_plugin")
+    plugin_module.register_afd()
+    # The pinned plugin suppresses compatibility-import errors in its entry
+    # point. Import explicitly and check installed functions so a native engine
+    # cannot silently stand in for an AFD role.
+    patches = {}
+    for name in (
+        "async_dp_engine",
+        "async_dp_forward_context",
+        "config_validation",
+        "engine_core",
+    ):
+        patches[name] = importlib.import_module(f"afd_plugin.compat.patches.{name}")
+    config_patch = patches["config_validation"]
+    engine_patch = patches["engine_core"]
+    if (
+        config_patch.arg_utils_module.EngineArgs.create_engine_config
+        is not config_patch.create_engine_config
+        or config_patch.config_module.VllmConfig.__post_init__
+        is not config_patch.__post_init__
+        or engine_patch.core_module.EngineCore.__init__ is not engine_patch.__init__
+        or engine_patch.core_module.EngineCoreProc.run_busy_loop
+        is not engine_patch.run_busy_loop
+        or engine_patch.core_module.DPEngineCoreProc.run_busy_loop
+        is not engine_patch.run_busy_loop
+    ):
+        raise RuntimeError("required AFD compatibility patches are not installed")
+    versions["afd_verified_patches"] = list(patches)
     distribution = importlib.metadata.distribution("vllm-afd-plugin")
     direct_url = distribution.read_text("direct_url.json")
     versions["afd_plugin_module"] = str(Path(plugin_module.__file__).resolve())
@@ -163,6 +190,24 @@ def afd_config(
         },
         separators=(",", ":"),
     )
+
+
+def wait_for_ffn_daemon(supervisor: Supervisor, timeout: int = 30) -> None:
+    """Require the connector loop's startup acknowledgement, not FFN HTTP."""
+    deadline = time.monotonic() + timeout
+    log_path = supervisor.log_dir / "ffn.log"
+    while time.monotonic() < deadline:
+        if supervisor.signal_number is not None:
+            raise KeyboardInterrupt
+        if supervisor.exited_child() is not None:
+            raise RuntimeError("AFD role exited before FFN connector-loop readiness")
+        if log_path.exists() and (
+            "AFD FFN EngineCore started; workers run connector loop."
+            in log_path.read_text(errors="replace")
+        ):
+            return
+        time.sleep(0.2)
+    raise TimeoutError(f"missing AFD FFN connector-loop startup evidence: {log_path}")
 
 
 def main() -> int:
@@ -262,6 +307,8 @@ def main() -> int:
         str(ffn_tp),
         "--additional-config",
         afd_config("ffn", afd_host, afd_port, attention_ranks, ffn_ranks),
+        "--worker-cls",
+        "afd_plugin.v1.worker.AFDFFNWorker",
         *common,
     ]
     attention_command = [
@@ -276,6 +323,8 @@ def main() -> int:
         str(attention_tp),
         "--additional-config",
         afd_config("attention", afd_host, afd_port, attention_ranks, ffn_ranks),
+        "--worker-cls",
+        "afd_plugin.v1.worker.AFDAttentionWorker",
         "--max-model-len",
         str(max_model_len),
         *common,
@@ -293,6 +342,8 @@ def main() -> int:
     ):
         base_env.pop(key, None)
     namespace = os.environ.get("DYN_NAMESPACE", f"dynamo-afd-{uuid.uuid4().hex}")
+    if not namespace.strip() or namespace == "dynamo":
+        raise ValueError("DYN_NAMESPACE must be nonempty and cannot be global 'dynamo'")
     base_env.update(
         {
             "DYN_NAMESPACE": namespace,
@@ -356,6 +407,7 @@ def main() -> int:
             model,
             ready_timeout,
         )
+        wait_for_ffn_daemon(supervisor)
         return supervisor.wait()
     except KeyboardInterrupt:
         return 128 + (supervisor.signal_number or signal.SIGINT)
