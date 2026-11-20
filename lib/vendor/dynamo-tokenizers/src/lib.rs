@@ -1,0 +1,1096 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+pub mod basetenkenizer;
+pub mod cache;
+pub mod fastokens;
+pub mod hf;
+pub mod tiktoken;
+
+// TODO: Add tokenizer benchmarks
+// TODO: Enable README.md as a module doc
+// #[doc = include_str!("../README.md")]
+
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
+use std::{fs::File, io::BufReader, ops::Deref, path::Path};
+
+use anyhow::Context as _;
+pub use anyhow::{Error, Result};
+
+pub use basetenkenizer::BasetenTokenizer;
+pub use cache::{
+    CacheTokenUsage, CacheTokenUsageFn, CachedTokenizer, L1CacheStats, SharedTokenizerCache,
+    SharedTokenizerCacheStats,
+};
+pub use fastokens::{FastTikTokenTokenizer, FastTokenizer};
+pub use hf::HuggingFaceTokenizer;
+pub use tiktoken::TikTokenTokenizer;
+pub use traits::DecodeResult;
+
+pub type TokenIdType = u32;
+
+/// A rendered prompt segment with an explicit trust boundary for special tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeSegment<'a> {
+    pub text: &'a str,
+    /// Recognize added/control tokens in this trusted renderer output.
+    ///
+    /// Set this to `false` for user, tool, and attribute content so text that
+    /// resembles a control token is encoded as ordinary text.
+    pub allow_special: bool,
+}
+
+impl<'a> EncodeSegment<'a> {
+    pub const fn new(text: &'a str, allow_special: bool) -> Self {
+        Self {
+            text,
+            allow_special,
+        }
+    }
+
+    pub const fn ordinary(text: &'a str) -> Self {
+        Self::new(text, false)
+    }
+
+    pub const fn control(text: &'a str) -> Self {
+        Self::new(text, true)
+    }
+}
+
+/// Represents the type of tokenizer being used
+#[derive(Debug)]
+pub enum TokenizerType {
+    HuggingFace(String),
+    TikToken(String),
+}
+
+/// character offsets in the original text
+pub type Offsets = (usize, usize);
+
+/// Contains the results of tokenizing text: token IDs, string tokens, and their spans
+#[derive(Debug, Clone)]
+pub enum Encoding {
+    /// Hugging Face
+    Hf(Box<tokenizers::tokenizer::Encoding>),
+    /// Sentence Piece
+    Sp(Vec<TokenIdType>),
+}
+
+impl Encoding {
+    pub fn token_ids(&self) -> &[u32] {
+        match self {
+            Encoding::Hf(inner) => inner.get_ids(),
+            Encoding::Sp(inner) => inner,
+        }
+    }
+}
+
+impl Hash for Encoding {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.token_ids().hash(state);
+    }
+}
+
+pub mod traits {
+    use super::*;
+
+    pub trait Encoder: Send + Sync {
+        fn encode(&self, input: &str) -> Result<Encoding>;
+        fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>>;
+
+        /// Encode Kimi K3-style renderer segments while preserving trusted
+        /// control-token and untrusted content boundaries.
+        ///
+        /// Each segment controls whether added/control tokens are recognized
+        /// through [`EncodeSegment::allow_special`]. This prevents text in user,
+        /// tool, or attribute content from becoming structural when it happens
+        /// to resemble a control token.
+        ///
+        /// The Baseten backend preserves legacy tiktoken behavior by splitting
+        /// each segment into chunks of at most 400,000 characters and splitting
+        /// whitespace/non-whitespace runs at 25,000 characters. Independent
+        /// chunks are encoded through the Rayon thread pool, then concatenated
+        /// in input order. Tokenizer post-processing is applied once after all
+        /// segment IDs have been joined.
+        ///
+        /// Backends must not implement this by flattening the segments first,
+        /// because that discards the special-token trust boundary.
+        fn encode_segments(&self, _segments: &[EncodeSegment<'_>]) -> Result<Encoding> {
+            Err(Error::msg(
+                "tokenizer backend does not support segmented encoding",
+            ))
+        }
+    }
+
+    /// Result of decoding token IDs to text.
+    ///
+    /// Distinguishes between fully valid UTF-8 output and output that contains
+    /// trailing incomplete multi-byte sequences (represented as U+FFFD).
+    /// This lets callers like `DecodeStream::step()` decide whether to emit or
+    /// buffer without resorting to hardcoded replacement-character string checks.
+    #[derive(Debug, Clone, PartialEq, Eq, strum::EnumIs)]
+    pub enum DecodeResult {
+        /// No trailing incomplete multi-byte sequences (text does not end with U+FFFD).
+        /// Note: the string may still contain *interior* U+FFFD characters from
+        /// mid-stream invalid byte sequences; only trailing status is tracked here.
+        Complete(String),
+        /// The decoded string ends with U+FFFD, indicating incomplete trailing
+        /// multi-byte bytes that may be completed by subsequent tokens.
+        Partial(String),
+    }
+
+    impl DecodeResult {
+        /// Returns a reference to the inner string.
+        pub fn as_str(&self) -> &str {
+            match self {
+                DecodeResult::Complete(s) | DecodeResult::Partial(s) => s,
+            }
+        }
+
+        /// Construct from a decoded string: `Partial` if it ends with U+FFFD, else `Complete`.
+        pub fn from_decoded(text: String) -> Self {
+            if text.ends_with('\u{FFFD}') {
+                DecodeResult::Partial(text)
+            } else {
+                DecodeResult::Complete(text)
+            }
+        }
+    }
+
+    impl From<String> for DecodeResult {
+        fn from(text: String) -> Self {
+            DecodeResult::from_decoded(text)
+        }
+    }
+
+    impl From<DecodeResult> for String {
+        fn from(result: DecodeResult) -> Self {
+            match result {
+                DecodeResult::Complete(s) | DecodeResult::Partial(s) => s,
+            }
+        }
+    }
+
+    /// Implementations must ensure that partial multi-byte sequences produce U+FFFD
+    /// (`\u{FFFD}`) in the output rather than returning `Err`. This is commonly achieved
+    /// via `String::from_utf8_lossy` (tiktoken) or library-internal byte-fallback handling
+    /// (HuggingFace). `DecodeStream::step()` relies on `DecodeResult::Partial` to detect
+    /// incomplete sequences and buffer tokens until the full character arrives.
+    pub trait Decoder: Send + Sync {
+        /// Whether appending tokens can still reinterpret the decoded suffix.
+        /// Callers must buffer an unstable suffix until a boundary or end of input.
+        fn has_unstable_suffix(
+            &self,
+            _token_ids: &[TokenIdType],
+            _skip_special_tokens: bool,
+        ) -> bool {
+            false
+        }
+
+        fn decode(
+            &self,
+            token_ids: &[TokenIdType],
+            skip_special_tokens: bool,
+        ) -> Result<DecodeResult>;
+    }
+
+    pub trait Tokenizer: Encoder + Decoder {
+        /// Validate that this tokenizer can be safely wrapped in the prefix cache.
+        ///
+        /// Implementations must explicitly opt in by returning `Ok(())`, or
+        /// return an error explaining why the tokenizer is incompatible.
+        fn validate_prefix_cache(&self) -> Result<()> {
+            Err(Error::msg("tokenizer does not support prefix caching"))
+        }
+
+        /// Apply construction-time [`TokenizerOptions`].
+        ///
+        /// The default implementation ignores the options — correct for
+        /// tokenizers with no applicable option.
+        fn with_options(self, options: TokenizerOptions) -> Self
+        where
+            Self: Sized,
+        {
+            let _ = options;
+            self
+        }
+        /// Vocabulary cardinality including added tokens, when the backend
+        /// can expose one. `None` for backends without a bounded id space or
+        /// vocabulary introspection.
+        fn vocab_size(&self) -> Option<usize> {
+            None
+        }
+
+        /// Resolve a token string to its vocabulary id, when the backend
+        /// supports lookup. `Ok(None)` when the token is not in the
+        /// vocabulary. `Err` when this backend cannot do id lookup at all —
+        /// kept distinct from a genuine vocabulary miss so callers can tell
+        /// "unsupported" from "looked up, not found".
+        ///
+        /// Defaults to unsupported, matching `encode_segments` and
+        /// `validate_prefix_cache`: only backends that can perform lookup
+        /// need to override it.
+        fn token_to_id(&self, _token: &str) -> Result<Option<TokenIdType>> {
+            Err(Error::msg(
+                "tokenizer backend does not support token lookup",
+            ))
+        }
+
+        /// Ids of added tokens marked special (e.g. BOS/EOS/PAD/control
+        /// tokens), as distinct from ordinary vocabulary tokens. `Ok(vec![])`
+        /// for backends that genuinely have none, or that do not distinguish
+        /// special from ordinary vocabulary ids. `Err` when the backend
+        /// cannot enumerate added tokens at all — an empty `Vec` alone
+        /// cannot carry that distinction.
+        ///
+        /// Defaults to unsupported, matching `token_to_id`: only backends
+        /// that can enumerate special ids need to override it.
+        fn special_token_ids(&self) -> Result<Vec<TokenIdType>> {
+            Err(Error::msg(
+                "tokenizer backend does not support special token enumeration",
+            ))
+        }
+
+        /// Count of special tokens `encode`'s `add_special_tokens: true`
+        /// path would add to a bare encoding (e.g. BOS/EOS), available
+        /// without performing an encode. `Ok(0)` for backends that
+        /// genuinely add none. `Err` when the backend cannot determine this
+        /// at all — a plain `0` alone cannot carry that distinction, and
+        /// this value feeds token-budget accounting where a silent `0`
+        /// would under-count rather than fail loudly.
+        ///
+        /// Defaults to unsupported, matching `token_to_id`: only backends
+        /// that can determine this count need to override it.
+        fn num_special_tokens_added(&self) -> Result<usize> {
+            Err(Error::msg(
+                "tokenizer backend does not support special token accounting",
+            ))
+        }
+        // fn make_unique_clone(&self) -> Box<dyn Tokenizer>;
+    }
+}
+
+pub fn file_json_field<T: serde::de::DeserializeOwned>(
+    json_file_path: &Path,
+    field_name: &str,
+) -> anyhow::Result<T> {
+    let file = File::open(json_file_path)
+        .with_context(|| format!("Failed to open file: {:?}", json_file_path))?;
+    let reader = BufReader::new(file);
+
+    let json_data: serde_json::Value = serde_json::from_reader(reader)
+        .with_context(|| format!("Failed to parse JSON from file: {:?}", json_file_path))?;
+
+    let map = json_data.as_object().ok_or_else(|| {
+        anyhow::anyhow!("JSON root is not an object in file: {:?}", json_file_path)
+    })?;
+
+    let field_value = map.get(field_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Field '{}' not found in JSON file: {:?}",
+            field_name,
+            json_file_path
+        )
+    })?;
+
+    serde_json::from_value(field_value.clone()).with_context(|| {
+        format!(
+            "Failed to deserialize field '{}' (value: {:?}) to the expected type from file: {:?}",
+            field_name, field_value, json_file_path
+        )
+    })
+}
+
+pub fn log_json_err(filename: &str, json: &str, err: &serde_json::Error) {
+    const ERROR_PREFIX: &str = ">>     ";
+
+    if !(err.is_syntax() || err.is_data()) {
+        return;
+    }
+
+    let line = err.line().saturating_sub(1);
+    let column = err.column().saturating_sub(1);
+
+    let json_lines: Vec<&str> = json.lines().collect();
+    if json_lines.is_empty() {
+        tracing::error!("JSON parsing error in {filename}: File is empty.");
+        return;
+    }
+
+    let start_index = line.saturating_sub(2);
+    let end_index = line.saturating_add(3).min(json_lines.len());
+
+    let mut context_lines: Vec<String> = (start_index..end_index)
+        .map(|i| {
+            if i == line {
+                format!("{ERROR_PREFIX}{}", json_lines[i])
+            } else {
+                format!("{:06} {}", i + 1, json_lines[i])
+            }
+        })
+        .collect();
+
+    let col_indicator = "_".to_string().repeat(column + ERROR_PREFIX.len()) + "^";
+    let error_in_context_idx = line - start_index;
+    if error_in_context_idx < context_lines.len() {
+        context_lines.insert(error_in_context_idx + 1, col_indicator);
+    }
+
+    tracing::error!(
+        "JSON parsing error in {filename}: Line {}, column {}:\n{}",
+        err.line(),
+        err.column(),
+        context_lines.join("\n")
+    );
+}
+
+impl Encoding {
+    pub fn get_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// Construction options for [`Tokenizer::from_file_with_options`] /
+/// [`create_tokenizer_from_file`], applied to concrete tokenizers via
+/// [`traits::Tokenizer::with_options`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenizerOptions {
+    /// Ask the tokenizer to add its declared special tokens (e.g. BOS/EOS via
+    /// its post-processor) during `encode`, `encode_batch`, and supported
+    /// `encode_segments` calls.
+    /// Defaults to `false`, the historical behavior.
+    ///
+    /// Applicable to Hugging Face and Baseten tokenizers.
+    pub add_special_tokens: bool,
+}
+
+/// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
+#[derive(Clone)]
+pub struct Tokenizer(Arc<dyn traits::Tokenizer>);
+
+impl Tokenizer {
+    pub fn from_file(file_path: &str) -> Result<Tokenizer> {
+        Ok(Tokenizer(create_tokenizer_from_file(file_path)?))
+    }
+
+    pub fn from_file_with_options(file_path: &str, options: TokenizerOptions) -> Result<Tokenizer> {
+        Ok(Tokenizer(create_tokenizer_from_file_with_options(
+            file_path, options,
+        )?))
+    }
+
+    /// Create a stateful sequence object for decoding token_ids into text.
+    /// Append the result of [`DecodeStream::finish`] when input ends; `step` may
+    /// retain a trailing byte-fallback run even when it currently forms valid UTF-8.
+    pub fn decode_stream(
+        &self,
+        prompt_token_ids: &[TokenIdType],
+        skip_special_tokens: bool,
+    ) -> DecodeStream {
+        DecodeStream::new(self.0.clone(), prompt_token_ids, skip_special_tokens)
+    }
+}
+
+impl Deref for Tokenizer {
+    type Target = Arc<dyn traits::Tokenizer>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Arc<dyn traits::Tokenizer>> for Tokenizer {
+    fn from(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
+        Tokenizer(tokenizer)
+    }
+}
+
+impl<T> From<Arc<T>> for Tokenizer
+where
+    T: traits::Tokenizer + 'static, // 'static is required to ensure T can be safely put into an Arc
+{
+    fn from(tokenizer: Arc<T>) -> Self {
+        Tokenizer(tokenizer)
+    }
+}
+
+/// Create a tokenizer from a file path to a tokenizer file.
+/// The file extension is used to determine the tokenizer type.
+/// Supported file types are:
+/// - json: HuggingFace tokenizer
+/// - model, tiktoken: tiktoken BPE tokenizer (requires `config.json` with a supported
+///   `model_type` in the same directory; currently: kimi, kimi_k2, kimi_k25, kimi_k3, kimi_k31)
+pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    create_tokenizer_from_file_with_options(file_path, Default::default())
+}
+
+/// Create a tokenizer from a file path to a tokenizer file with additional tokenizer option.
+/// The file extension is used to determine the tokenizer type.
+/// Supported file types are:
+/// - json: HuggingFace tokenizer
+/// - model, tiktoken: tiktoken BPE tokenizer (requires `config.json` with a supported
+///   `model_type` in the same directory; currently: kimi, kimi_k2, kimi_k25, kimi_k3, kimi_k31)
+pub fn create_tokenizer_from_file_with_options(
+    file_path: &str,
+    options: TokenizerOptions,
+) -> Result<Arc<dyn traits::Tokenizer>> {
+    use traits::Tokenizer as _;
+
+    let path = Path::new(file_path);
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| Error::msg("Failed to read file extension".to_string()))?;
+
+    match extension {
+        "json" => {
+            let tokenizer = HuggingFaceTokenizer::from_file(file_path)?.with_options(options);
+            Ok(Arc::new(tokenizer))
+        }
+        "model" | "tiktoken" => {
+            let tokenizer = TikTokenTokenizer::from_file_auto(file_path)?.with_options(options);
+            Ok(Arc::new(tokenizer))
+        }
+        _ => Err(Error::msg(format!(
+            "Unsupported tokenizer file type: .{extension}"
+        ))),
+    }
+}
+
+// With incremental detokenization, we need to consider the final context tokens when handling the initial decode tokens.
+// This is the initial offset from the end of the context that we start decoding from.
+// Both Huggingface TGI and vLLM use this same value.
+// See: https://github.com/huggingface/text-generation-inference/blob/24c2bff65924801ddf90fa24fcc72752d4f45538/server/text_generation_server/models/mamba.py#L169
+// and https://github.com/vllm-project/vllm/blob/da2705198fa19030a25d0bea437f7be6547d47d4/vllm/transformers_utils/detokenizer_utils.py#L51
+const INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET: usize = 5;
+
+/// DecodeStream will keep the state necessary to produce individual chunks of
+/// strings given an input stream of token_ids.
+///
+/// This is necessary because decoding in general cannot achieve that since strings
+/// depend on surrounding ids to provide a valid string. Typically stripping extra spaces.
+pub struct DecodeStream {
+    /// The tokenizer used to decode token_ids
+    tokenizer: Arc<dyn traits::Tokenizer>,
+
+    skip_special_tokens: bool,
+    /// A temporary buffer of the necessary token_ids needed
+    /// to produce valid string chunks.
+    /// This typically contains 3 parts:
+    ///  - read
+    ///  - prefix
+    ///  - rest
+    ///
+    /// Read is the bit necessary to surround the prefix
+    /// so decoding the whole ids produces a valid prefix.
+    /// Prefix is the previously produced string, kept around to trim off of
+    /// the next valid chunk
+    all_token_ids: Vec<u32>,
+
+    prefix_offset: usize,
+
+    read_offset: usize,
+
+    /// Whether any generated text has already been returned to the caller.
+    has_emitted: bool,
+}
+
+impl DecodeStream {
+    pub fn new(
+        tokenizer: Arc<dyn traits::Tokenizer>,
+        prompt_token_ids: &[TokenIdType],
+        skip_special_tokens: bool,
+    ) -> Self {
+        // Earlier prompt tokens are never read by incremental decoding. Keep the
+        // same context suffix and rebase its offsets before copying it.
+        let context_start = prompt_token_ids
+            .len()
+            .saturating_sub(INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET);
+        let prompt_token_ids = prompt_token_ids[context_start..].to_vec();
+        let num_input_tokens = prompt_token_ids.len();
+        Self {
+            tokenizer,
+            skip_special_tokens,
+            all_token_ids: prompt_token_ids,
+            prefix_offset: 0,
+            read_offset: num_input_tokens,
+            has_emitted: false,
+        }
+    }
+
+    /// Step appends a token_id to the internal state and tries to produce a text chunk.
+    ///
+    /// Implementation directly copied from Huggingface's TGI:
+    /// https://github.com/huggingface/text-generation-inference/blob/24c2bff65924801ddf90fa24fcc72752d4f45538/server/text_generation_server/models/model.py#L144
+    ///
+    /// Returning `None` means the given id is not enough to produce a chunk.
+    /// This typically happens with `byte_fallback` options where some tokens do not
+    /// represent valid UTF-8, and only follow-up token_ids will help produce
+    /// a valid chunk.
+    ///
+    /// An error is terminal for this stream because the token may already have
+    /// been appended to its internal state.
+    pub fn step(&mut self, id: u32) -> Result<Option<String>> {
+        self.all_token_ids.push(id);
+
+        if self.tokenizer.has_unstable_suffix(
+            &self.all_token_ids[self.read_offset..],
+            self.skip_special_tokens,
+        ) {
+            return Ok(None);
+        }
+        self.decode_pending(false)
+    }
+
+    /// Decode the remaining suffix once no further tokens can reinterpret it.
+    /// Call this at end-of-input and append its output after all `step` chunks.
+    /// Dropping the stream without finishing discards any buffered text.
+    pub fn finish(&mut self) -> Result<Option<String>> {
+        self.decode_pending(true)
+    }
+
+    fn decode_pending(&mut self, finishing: bool) -> Result<Option<String>> {
+        if self.read_offset == self.all_token_ids.len() {
+            return Ok(None);
+        }
+
+        let prefix_text: String = self
+            .tokenizer
+            .decode(
+                &self.all_token_ids[self.prefix_offset..self.read_offset],
+                self.skip_special_tokens,
+            )?
+            .into();
+
+        let new_result = self.tokenizer.decode(
+            &self.all_token_ids[self.prefix_offset..],
+            self.skip_special_tokens,
+        )?;
+
+        let new_text = new_result.as_str();
+        let is_partial = new_result.is_partial() && !finishing;
+
+        // Once generated text has been returned, decoding must remain append-only.
+        // A complete rewrite cannot be repaired after the caller has seen the old text.
+        if self.has_emitted && !is_partial && !new_text.starts_with(prefix_text.as_str()) {
+            return Err(Error::msg(
+                "incremental decoding rewrote already emitted text",
+            ));
+        }
+
+        if new_text.len() > prefix_text.len() && !is_partial {
+            let requested_split = prefix_text.len();
+            let split = if self.has_emitted {
+                // starts_with() guarantees this is a character boundary and preserves
+                // everything already returned to the caller.
+                requested_split
+            } else {
+                // Rewinding into prompt context is safe because prompt text was not
+                // returned by this stream.
+                new_text.floor_char_boundary(requested_split)
+            };
+
+            let emitted = new_text[split..].to_string();
+
+            self.prefix_offset = self.read_offset;
+            self.read_offset = self.all_token_ids.len();
+            self.has_emitted = true;
+
+            Ok(Some(emitted))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod decode_stream_unicode_tests {
+    use super::{DecodeResult, DecodeStream, Encoding, Result, TokenIdType};
+    use std::sync::Arc;
+
+    struct RewritingTokenizer {
+        prefix_text: &'static str,
+        rewritten_text: &'static str,
+        prefix_is_partial: bool,
+    }
+
+    impl super::traits::Encoder for RewritingTokenizer {
+        fn encode(&self, _input: &str) -> Result<Encoding> {
+            Ok(Encoding::Sp(vec![]))
+        }
+
+        fn encode_batch(&self, _inputs: &[&str]) -> Result<Vec<Encoding>> {
+            Ok(vec![])
+        }
+    }
+
+    impl super::traits::Decoder for RewritingTokenizer {
+        fn decode(
+            &self,
+            token_ids: &[TokenIdType],
+            _skip_special_tokens: bool,
+        ) -> Result<DecodeResult> {
+            let result = match token_ids.len() {
+                1 if self.prefix_is_partial => DecodeResult::Partial(self.prefix_text.to_string()),
+                1 => DecodeResult::Complete(self.prefix_text.to_string()),
+                2 => DecodeResult::Complete(self.rewritten_text.to_string()),
+                _ => DecodeResult::Complete(String::new()),
+            };
+            Ok(result)
+        }
+    }
+
+    impl super::traits::Tokenizer for RewritingTokenizer {}
+
+    #[test]
+    fn prompt_suffix_preserves_decode_inputs_and_output() {
+        let tokenizer: Arc<dyn super::traits::Tokenizer> = Arc::new(
+            super::HuggingFaceTokenizer::from_file(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minimal-bpe/tokenizer.json"
+            ))
+            .unwrap(),
+        );
+        for prompt_len in [0usize, 1, 4, 5, 6, 775_168] {
+            let prompt: Vec<_> = (0..prompt_len)
+                .map(|index| 1 + (index % 22) as u32)
+                .collect();
+            for skip_special_tokens in [false, true] {
+                let mut stream = DecodeStream::new(tokenizer.clone(), &prompt, skip_special_tokens);
+                // Reconstruct the previous full-prompt state as a parity oracle.
+                let mut full = DecodeStream {
+                    tokenizer: tokenizer.clone(),
+                    skip_special_tokens,
+                    all_token_ids: prompt.clone(),
+                    prefix_offset: prompt_len
+                        .saturating_sub(super::INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET),
+                    read_offset: prompt_len,
+                    has_emitted: false,
+                };
+                assert!(stream.all_token_ids.capacity() <= 5);
+                for token in [5, 9, 12, 12, 13, 0, 1, 17, 13, 14, 12, 8, 2] {
+                    assert_eq!(
+                        &stream.all_token_ids[stream.prefix_offset..stream.read_offset],
+                        &full.all_token_ids[full.prefix_offset..full.read_offset],
+                    );
+                    assert_eq!(
+                        &stream.all_token_ids[stream.prefix_offset..],
+                        &full.all_token_ids[full.prefix_offset..],
+                    );
+                    let actual = stream.step(token).map_err(|error| error.to_string());
+                    let expected = full.step(token).map_err(|error| error.to_string());
+                    assert_eq!(actual, expected, "prompt length {prompt_len}");
+                    if actual.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allows_boundary_recovery_before_generated_text_is_emitted() {
+        for (prefix_text, rewritten_text, expected) in [
+            ("㺄馉凓鄗\u{FFFD}", "㺄馉凓鄗𫷲", "𫷲"),
+            (
+                "JUnitworkflow Completion intuition\u{FFFD}",
+                "JUnitworkflow Completion intuition𝟙",
+                "𝟙",
+            ),
+        ] {
+            let tokenizer: Arc<dyn super::traits::Tokenizer> = Arc::new(RewritingTokenizer {
+                prefix_text,
+                rewritten_text,
+                prefix_is_partial: true,
+            });
+            let mut stream = DecodeStream::new(tokenizer, &[1], false);
+
+            assert_eq!(stream.step(2).unwrap(), Some(expected.to_string()));
+        }
+    }
+
+    #[test]
+    fn errors_when_incremental_decode_rewrites_emitted_text() {
+        for (prefix_text, rewritten_text) in [
+            ("abcde", "abcdXY"),
+            ("abcde", "abcdX"),
+            ("abcde", "abcd"),
+            ("㺄馉凓鄗abc", "㺄馉凓鄗𫷲"),
+            (
+                "JUnitworkflow Completion intuitionabc",
+                "JUnitworkflow Completion intuition𝟙",
+            ),
+        ] {
+            let tokenizer: Arc<dyn super::traits::Tokenizer> = Arc::new(RewritingTokenizer {
+                prefix_text,
+                rewritten_text,
+                prefix_is_partial: false,
+            });
+            let mut stream = DecodeStream::new(tokenizer, &[], false);
+
+            assert_eq!(stream.step(1).unwrap(), Some(prefix_text.to_string()));
+
+            let error = stream.step(2).unwrap_err();
+            assert!(error.to_string().contains("already emitted text"));
+        }
+    }
+
+    #[test]
+    fn emits_suffix_when_incremental_decode_preserves_emitted_text() {
+        let tokenizer: Arc<dyn super::traits::Tokenizer> = Arc::new(RewritingTokenizer {
+            prefix_text: "abcde",
+            rewritten_text: "abcdeXY",
+            prefix_is_partial: false,
+        });
+        let mut stream = DecodeStream::new(tokenizer, &[], false);
+
+        assert_eq!(stream.step(1).unwrap(), Some("abcde".to_string()));
+        assert_eq!(stream.step(2).unwrap(), Some("XY".to_string()));
+    }
+}
+
+/// Maintains state for an ongoing sequence of tokens and their decoded text
+pub struct Sequence {
+    /// Encodes text -> token_ids
+    tokenizer: Tokenizer,
+
+    /// The current sequence of token ids
+    token_ids: Vec<TokenIdType>,
+
+    /// The position in the current sequence the last decoded token completed
+    prefix_offset: usize,
+
+    /// Current position in the sequence
+    read_offset: usize,
+}
+
+impl std::fmt::Debug for Sequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sequence")
+            .field("tokenizer", &"Arc<dyn Tokenizer>")
+            .field(
+                "token_ids",
+                &format_args!("{}", {
+                    let token_ids = self.token_ids();
+                    if token_ids.len() <= 20 {
+                        format!("{:?}", token_ids)
+                    } else {
+                        let first_ten = &token_ids[..10];
+                        let last_ten = &token_ids[token_ids.len() - 10..];
+                        format!("{:?} ... {:?}", first_ten, last_ten)
+                    }
+                }),
+            )
+            .field("prefix_offset", &self.prefix_offset)
+            .field("read_offset", &self.read_offset)
+            .field("token count", &self.token_ids.len())
+            .finish()
+    }
+}
+
+impl Sequence {
+    pub fn new(tokenizer: Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            token_ids: Vec::new(),
+            prefix_offset: 0,
+            read_offset: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.token_ids.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.token_ids.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.token_ids.clear();
+        self.prefix_offset = 0;
+        self.read_offset = 0;
+    }
+
+    pub fn append_text(&mut self, input: &str) -> Result<()> {
+        // let tokenizer = self.tokenizer.read().map_err(|err| {
+        //     Error::msg(format!("Failed to acquire read lock on tokenizer: {}", err))
+        // })?;
+
+        let encoding = self.tokenizer.encode(input)?;
+        self.token_ids.extend(encoding.token_ids());
+        Ok(())
+    }
+
+    // Based on
+    // https://github.com/huggingface/text-generation-inference/blob/v0.9.4/server/text_generation_server/models/model.py#L62C9-L62C15
+    // under Apache 2.0 license
+    pub fn append_token_id(&mut self, token_id: TokenIdType) -> Result<String> {
+        self.token_ids.push(token_id);
+        // log::trace!("pushed token_id: {}", token_id);
+
+        let prefix_text: String = self
+            .tokenizer
+            .decode(&self.token_ids[self.prefix_offset..self.read_offset], false)?
+            .into();
+
+        let new_result = self
+            .tokenizer
+            .decode(&self.token_ids[self.prefix_offset..], false)?;
+
+        let new_text = new_result.as_str();
+
+        // if the end character of the previous returned sequence is a multi-byte character
+        // then we can not split the text on that byte offset, so we roll back to the byte offset
+        // of the start of that character
+        let mut prefix_text_len = prefix_text.len();
+        while !new_text.is_char_boundary(prefix_text_len) && prefix_text_len > 0 {
+            prefix_text_len -= 1;
+        }
+        let prefix_text_len = prefix_text_len;
+
+        if new_text.len() > prefix_text.len() {
+            if new_result.is_partial() {
+                return Ok("".to_string());
+            } else {
+                // shift and update the state
+                let new_text = new_text[prefix_text_len..]
+                    .to_string()
+                    .replace('\u{FFFD}', "");
+                self.prefix_offset = self.read_offset;
+                self.read_offset = self.token_ids.len();
+                return Ok(new_text);
+            }
+        }
+
+        Ok("".to_string())
+    }
+
+    pub fn tokenizer(&self) -> Tokenizer {
+        self.tokenizer.clone()
+    }
+
+    pub fn token_ids(&self) -> &[TokenIdType] {
+        &self.token_ids
+    }
+
+    pub fn text(&self) -> Result<String> {
+        // let tokenizer = self.tokenizer.read().map_err(|err| {
+        //     Error::msg(format!("Failed to acquire read lock on tokenizer: {}", err))
+        // })?;
+        Ok(self.tokenizer.decode(&self.token_ids, false)?.into())
+    }
+}
+
+/// The output conditions/values of a SequenceDecoder::add_token_id operation.
+/// Result of decoding a token, indicating whether text was produced or a stop condition was met
+pub enum SequenceDecoderOutput {
+    /// The text for the appended token_id
+    Text(String),
+
+    /// A sequence of token_ids has been partially matched a stop sequence, so the text is held
+    /// until either a match or a divergence
+    Held,
+
+    /// Indicates that a stop sequence has been matched and the decoder is stopped.
+    /// Subsequent calls to append_token_id will return an error
+    Stopped,
+
+    /// Indicates that a stop token_id has been matched and the decoder is stopped.
+    /// Subsequent calls to append_token_id will return an error
+    /// The text for the stop token_id is returned
+    StoppedWithText(String),
+}
+
+/// A Sequence for decoding a stream of token ids into text and detecting stop sequences.
+/// A stop sequence is either a matching token_id or a sequence of texts/strings which match.
+/// Matches happen first at the token-level, then at the sequence-level. Hidden takes precedence
+/// over visible. For example, if you put the same token_id in both `stop_token_ids_visible` and
+/// `stop_token_ids_hidden`, the token_id will be treated as hidden.
+#[derive(Debug)]
+pub struct StopSequenceDecoder {
+    // The current sequence of token ids
+    sequence: Sequence,
+
+    // Stop Tokens - the presence of any one of these should trigger a stop
+    // If found, the text for the matched token will be returned
+    stop_token_ids_visible: Vec<TokenIdType>,
+
+    // Stop Tokens - the presence of any one of these should trigger a stop
+    // If found, the text for the matched token will NOT be returned
+    stop_token_ids_hidden: Vec<TokenIdType>,
+
+    // Stop Words - the presence of any one of these should trigger a stop
+    // If found, the text for the matched token will be returned
+    #[allow(dead_code)]
+    stop_sequences_visible: Vec<String>,
+
+    // Stop Words - the presence of any one of these should trigger a stop
+    // If found, the text for the matched token will NOT be returned
+    stop_sequences_hidden: Vec<String>,
+
+    // If the decoder has observed and returned a stop SequenceDecoderOutput,
+    // futhur calls to append_token_id will return an error
+    stopped: bool,
+
+    // text jail - if a partial stop sequence is being observed, we hold/jail the text
+    // until either the stop sequence is matched or the sequence is reset by a divergence
+    state: String,
+}
+
+impl StopSequenceDecoder {
+    /// Builder object for configurating a StopSequenceDecoder
+    pub fn builder(tokenizer: Tokenizer) -> StopSequenceDecoderBuilder {
+        StopSequenceDecoderBuilder::new(tokenizer)
+    }
+
+    /// Add a token_id to the sequence and return the SequenceDecoderOutput
+    pub fn append_token_id(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
+        if self.stopped {
+            return Err(Error::msg("Decoder is stopped"));
+        }
+
+        // update the sequence
+        let text = self.sequence.append_token_id(token_id)?;
+
+        // append the text to the state
+        self.state.push_str(text.as_str());
+
+        let mut stop: bool = false;
+        let mut visible: bool = false;
+
+        if self.stop_token_ids_visible.contains(&token_id) {
+            stop = true;
+            visible = true;
+        }
+
+        if self.stop_token_ids_hidden.contains(&token_id) {
+            stop = true;
+            visible = false;
+        }
+
+        if stop {
+            self.stopped = true;
+            let state = std::mem::take(&mut self.state);
+            if visible {
+                return Ok(SequenceDecoderOutput::StoppedWithText(state));
+            }
+            return Ok(SequenceDecoderOutput::Stopped);
+        }
+
+        // determine if state matches any of the stop sequences
+        for stop_sequence in self.stop_sequences_hidden.iter() {
+            if stop_sequence.starts_with(&self.state) {
+                if stop_sequence == &self.state {
+                    // on matched stop sequence, we do NOT return the jailed stop sequence
+                    self.stopped = true;
+                    return Ok(SequenceDecoderOutput::Stopped);
+                } else {
+                    return Ok(SequenceDecoderOutput::Held);
+                }
+            }
+        }
+
+        let state = std::mem::take(&mut self.state);
+        Ok(SequenceDecoderOutput::Text(state))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sequence.token_ids.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.sequence.token_ids.len()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.stopped
+    }
+
+    pub fn close(&mut self) {
+        self.stopped = true;
+    }
+}
+
+pub struct StopSequenceDecoderBuilder {
+    tokenizer: Tokenizer,
+    stop_token_ids_visible: Vec<TokenIdType>,
+    stop_token_ids_hidden: Vec<TokenIdType>,
+    stop_sequences_visible: Vec<String>,
+    stop_sequences_hidden: Vec<String>,
+}
+
+impl StopSequenceDecoderBuilder {
+    pub fn new(tokenizer: Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            stop_token_ids_visible: Vec::new(),
+            stop_token_ids_hidden: Vec::new(),
+            stop_sequences_visible: Vec::new(),
+            stop_sequences_hidden: Vec::new(),
+        }
+    }
+
+    /// Adds a visible stop token id to the StopSequenceDecoder
+    pub fn add_stop_token_id_visible(mut self, token_id: TokenIdType) -> Self {
+        self.stop_token_ids_visible.push(token_id);
+        self
+    }
+
+    /// Adds a list of visible stop token ids to the StopSequenceDecoder
+    /// Each token_id is added as for an individual match
+    pub fn add_stop_token_ids_visible(mut self, token_ids: &[TokenIdType]) -> Self {
+        self.stop_token_ids_visible.extend(token_ids);
+        self
+    }
+
+    /// Adds a hidden stop token id to the StopSequenceDecoder
+    pub fn add_stop_token_id_hidden(mut self, token_id: TokenIdType) -> Self {
+        self.stop_token_ids_hidden.push(token_id);
+        self
+    }
+
+    /// Adds a list of hidden stop token ids to the StopSequenceDecoder
+    /// Each token_id is added as for an individual match
+    pub fn add_stop_token_ids_hidden(mut self, token_ids: &[TokenIdType]) -> Self {
+        self.stop_token_ids_hidden.extend(token_ids);
+        self
+    }
+
+    pub fn add_stop_sequence_visible(mut self, text: &str) -> Self {
+        self.stop_sequences_visible.push(text.to_string());
+        self
+    }
+
+    pub fn add_stop_sequences_visible(mut self, strings: &[&str]) -> Self {
+        self.stop_sequences_visible
+            .extend(strings.iter().map(|text| text.to_string()));
+        self
+    }
+
+    pub fn add_stop_sequence_hidden(mut self, text: &str) -> Self {
+        self.stop_sequences_hidden.push(text.to_string());
+        self
+    }
+
+    pub fn add_stop_sequences_hidden(mut self, strings: &[&str]) -> Self {
+        self.stop_sequences_hidden
+            .extend(strings.iter().map(|text| text.to_string()));
+        self
+    }
+
+    pub fn build(self) -> Result<StopSequenceDecoder> {
+        Ok(StopSequenceDecoder {
+            sequence: Sequence::new(self.tokenizer.clone()),
+            stop_token_ids_visible: self.stop_token_ids_visible,
+            stop_token_ids_hidden: self.stop_token_ids_hidden,
+            stop_sequences_visible: self.stop_sequences_visible,
+            stop_sequences_hidden: self.stop_sequences_hidden,
+            stopped: false,
+            state: String::new(),
+        })
+    }
+}

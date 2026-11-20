@@ -39,6 +39,7 @@ members = [
     "deploy/inference-gateway/sidecar",
 ]
 resolver = "3"
+exclude = ["lib/vendor/dynamo-tokenizers"]
 
 [workspace.package]
 version = "1.7.0"
@@ -216,3 +217,7 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+# dynamo-tokenizers 3.1.4-kimi-k3.1-pro-dev.1 with per-segment encode caching (frontend-crates #499).
+[patch.crates-io]
+dynamo-tokenizers = { path = "lib/vendor/dynamo-tokenizers" }

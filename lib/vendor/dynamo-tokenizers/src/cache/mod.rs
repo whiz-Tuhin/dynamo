@@ -1,0 +1,854 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// SPDX-FileCopyrightText: Copyright (c) 2024 Simo Lin, Chang Su, Keyang Ru (llm-tokenizer authors)
+//
+// Portions adapted from sgl-project/llm-tokenizer v1.3.2 (Apache-2.0).
+// Upstream: https://github.com/lightseekorg/smg
+// Modifications: removed L0 layer, removed `add_special_tokens` plumbing (Dynamo's
+// `Encoder::encode` has no such flag), dropped fingerprinting, retargeted onto
+// `crate::traits::Tokenizer`.
+
+//! Tokenizer caching layer (L1: prefix matching at special-token boundaries).
+//!
+//! Wraps a cache-compatible [`Tokenizer`] in a cache that records prefix
+//! tokenizations at every special-token boundary. On a hit, the cached prefix
+//! tokens are merged with a fresh encode of the trailing suffix only — turning
+//! O(N) tokenization work into O(suffix_len) when prompts share a system prefix.
+//!
+//! # Correctness
+//!
+//! Boundaries are taken **only** at positions immediately following a registered
+//! special token (e.g. `<|im_start|>`, `<|im_end|>`, `<s>`, `</s>`). Special tokens
+//! are atomic in BPE (`special: true, normalized: false`), so splitting there
+//! preserves the invariant `tokenize(prefix) + tokenize(suffix) == tokenize(prefix + suffix)`.
+//! No fallback to whitespace or punctuation — better to miss than to corrupt.
+//! Callers must supply actual atomic special tokens recognized by the inner tokenizer;
+//! adding arbitrary strings to the boundary list is unsafe.
+//!
+//! Atomicity alone is insufficient when registered special-token strings can overlap.
+//! [`CachedTokenizer::new`] disables L1 for such sets because the boundary scanner could
+//! otherwise split inside the token selected by the underlying tokenizer.
+//!
+//! # Storage normalization
+//!
+//! When L1 is enabled, **every** `encode` returns [`Encoding::Sp`] (token-ids only) —
+//! hits merge cached prefix ids with a fresh suffix encode, and misses assemble the ids
+//! from the per-boundary segment encodes (see [`L1Cache::populate_and_encode`]) — even
+//! when the inner tokenizer would have produced [`Encoding::Hf`] (rich offsets/attention/
+//! etc). All current downstream consumers in Dynamo only call [`Encoding::token_ids`], so
+//! this lossy normalization is safe; revisit if a caller starts reading offsets or
+//! attention masks from encodings produced through the cache.
+//!
+//! # Configuration
+//!
+//! - `special_tokens: Vec<String>` — must be supplied at construction (the
+//!   [`Tokenizer`] trait is intentionally minimal and does not expose them).
+//!   An empty list disables L1: `encode`/`encode_batch` short-circuit straight
+//!   to the inner tokenizer with no lookup, no miss-counter bump, and no
+//!   insert attempt. A list whose members can overlap disables L1 identically.
+//! - `encode_segments` caches whole segments instead of prefixes: each segment of at
+//!   least 128 bytes is keyed by its exact text and `allow_special` flag (a key space
+//!   disjoint from prefix keys), so every turn of a multi-turn conversation re-encodes
+//!   only its new segments. Flattening segments for prefix matching would discard their
+//!   special-token trust boundaries, and segment caching never needs to: backends
+//!   encode segments independently. Shorter segments (control markers) are encoded in
+//!   contiguous runs and never cached. Segments are cached only while L1 is active (a
+//!   non-empty, non-overlapping special-token set), so an empty set still disables all
+//!   caching.
+//! - `max_memory_bytes` — token-ID payload byte budget, excluding keys and metadata.
+//!   Moka shares admission and eviction via W-TinyLFU. Deferred maintenance makes the
+//!   capacity approximate; it is not a limit on total process memory.
+//! - [`CachedTokenizer::new`] owns a private cache. [`CachedTokenizer::new_with_cache`]
+//!   shares storage across wrappers; entries survive a wrapper being dropped while
+//!   shared storage remains alive. Equal namespaces must identify identical tokenizer
+//!   behavior, including tokenizer files, backend, and options that affect token IDs.
+//!
+//! # Provenance
+//!
+//! Adapted from `llm-tokenizer` v1.3.2 (`cache/l1.rs`, `cache/mod.rs`). L0 and
+//! upstream fingerprinting were dropped; L1 covers the multi-turn-chat workload.
+//! Shared caches use caller-supplied namespaces to separate tokenizer identities.
+
+mod l1;
+
+use std::sync::Arc;
+
+use l1::PrefixLookup;
+pub use l1::{
+    CacheEventFn, L1Cache, L1CacheStats, SharedTokenizerCache, SharedTokenizerCacheStats,
+};
+
+use crate::{
+    EncodeSegment, Encoding, Result, TokenIdType,
+    traits::{DecodeResult, Decoder, Encoder, Tokenizer},
+};
+
+/// Smallest segment (in bytes) that [`CachedTokenizer::encode_segments`] caches.
+/// Shorter segments, such as control markers, encode faster than an entry pays off.
+const MIN_CACHED_SEGMENT_BYTES: usize = 128;
+
+/// Token-level cache usage for one successful encode.
+///
+/// A partial cache hit reports both cached prefix tokens and uncached suffix tokens.
+/// Their sum always equals the number of tokens returned by the encode operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTokenUsage {
+    /// Tokens returned from the cached prefix.
+    pub cached_tokens: usize,
+    /// Tokens freshly encoded from the uncached suffix.
+    pub uncached_tokens: usize,
+}
+
+/// Optional observer for token-level cache usage.
+pub type CacheTokenUsageFn = Arc<dyn Fn(CacheTokenUsage) + Send + Sync>;
+
+/// Caching wrapper around an inner tokenizer.
+///
+/// Implements [`Encoder`], [`Decoder`], and [`Tokenizer`]; decode calls pass
+/// through to the inner tokenizer (decoding is fast and rarely repeated).
+pub struct CachedTokenizer {
+    inner: Arc<dyn Tokenizer>,
+    l1: L1Cache,
+    l1_enabled: bool,
+    extend_on_hit: bool,
+    /// Called once after every successful encode while L1 is active.
+    token_observer: Option<CacheTokenUsageFn>,
+}
+
+impl CachedTokenizer {
+    /// Construct a cached tokenizer.
+    ///
+    /// `special_tokens` is the list of atomic special-token strings the inner
+    /// tokenizer recognizes (typically extracted via the HuggingFace tokenizer's
+    /// `get_added_tokens_decoder()` filtering by `special == true`). An empty list
+    /// disables L1 — `encode`/`encode_batch` short-circuit to the inner tokenizer
+    /// without touching the cache or its counters. An overlapping token set also disables
+    /// L1, with a warning, because its boundaries are ambiguous.
+    ///
+    /// `max_memory_bytes` is the private token-ID payload byte budget. Moka defers
+    /// eviction, so the budget is approximate and excludes keys and metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns the inner tokenizer's compatibility error when it cannot be
+    /// safely wrapped in the prefix cache.
+    pub fn new(
+        inner: Arc<dyn Tokenizer>,
+        special_tokens: Vec<String>,
+        max_memory_bytes: usize,
+    ) -> Result<Self> {
+        Self::build(inner, special_tokens, |tokens| {
+            L1Cache::new(max_memory_bytes, tokens)
+        })
+    }
+
+    /// Construct a tokenizer using shared storage and a caller-supplied namespace.
+    ///
+    /// Equal namespaces share entries and must describe identical tokenizer behavior,
+    /// including tokenizer files, backend, and encoding options. Different namespaces
+    /// compete for the same byte budget but cannot reuse each other's token IDs.
+    /// Entries survive this wrapper being dropped while the shared cache remains alive.
+    /// The eligibility checks are the same as [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the inner tokenizer's compatibility error if prefix caching is unsafe.
+    pub fn new_with_cache(
+        inner: Arc<dyn Tokenizer>,
+        special_tokens: Vec<String>,
+        shared_cache: SharedTokenizerCache,
+        namespace: &[u8],
+    ) -> Result<Self> {
+        Self::build(inner, special_tokens, |tokens| {
+            L1Cache::new_with_cache(shared_cache, tokens, namespace)
+        })
+    }
+
+    fn build(
+        inner: Arc<dyn Tokenizer>,
+        mut special_tokens: Vec<String>,
+        make_cache: impl FnOnce(Vec<String>) -> L1Cache,
+    ) -> Result<Self> {
+        inner.validate_prefix_cache()?;
+        special_tokens.retain(|token| !token.is_empty());
+
+        // Overlapping matches can create a cache boundary inside a token selected by the
+        // inner tokenizer. Preserve correctness by bypassing this optional optimization.
+        let overlapping_specials = match l1::first_unsafe_overlap(&special_tokens) {
+            Some((first, second)) => {
+                tracing::warn!(
+                    target: "tokenizer",
+                    first_token = first,
+                    second_token = second,
+                    special_token_count = special_tokens.len(),
+                    "special tokens can overlap; tokenizer prefix cache disabled"
+                );
+                true
+            }
+            None => false,
+        };
+
+        let l1_enabled = !special_tokens.is_empty() && !overlapping_specials;
+        let cache_tokens = if l1_enabled {
+            special_tokens
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            inner,
+            l1: make_cache(cache_tokens),
+            l1_enabled,
+            extend_on_hit: false,
+            token_observer: None,
+        })
+    }
+
+    /// Enable partial-hit extension. When on, a partial cache hit also caches the
+    /// freshly-tokenized suffix at its deepest special-token boundary, so each turn of
+    /// a growing multi-turn conversation hits deeper than the last and per-turn
+    /// tokenization cost stops growing with conversation length. Default off.
+    pub fn with_extend(mut self, enabled: bool) -> Self {
+        self.extend_on_hit = enabled;
+        self
+    }
+
+    /// Install hit/miss callbacks so each L1 lookup pushes an event into the
+    /// supplied closures (e.g. `Prometheus::Counter::inc`). Replaces any
+    /// previously-set observer.
+    pub fn with_observer(mut self, on_hit: CacheEventFn, on_miss: CacheEventFn) -> Self {
+        self.l1.set_observer(on_hit, on_miss);
+        self
+    }
+
+    /// Install a callback that receives exact cached and uncached token counts after each
+    /// successful encode while L1 is active. A partial hit reports both categories, which
+    /// lets consumers maintain token-level cache totals and derive a reuse ratio. Replaces
+    /// any previously-set token observer.
+    ///
+    /// This observer is not called when the special-token set is empty (and L1 is therefore
+    /// disabled) or when encoding returns an error.
+    pub fn with_token_observer(mut self, observer: CacheTokenUsageFn) -> Self {
+        self.token_observer = Some(observer);
+        self
+    }
+
+    fn observe_token_usage(&self, cached_tokens: usize, total_tokens: usize) {
+        if let Some(observer) = &self.token_observer {
+            let uncached_tokens = total_tokens
+                .checked_sub(cached_tokens)
+                .expect("cached token count cannot exceed total token count");
+            observer(CacheTokenUsage {
+                cached_tokens,
+                uncached_tokens,
+            });
+        }
+    }
+
+    /// Wrapper-local hits/misses and namespace-wide entries/token bytes.
+    /// Shared storage statistics scan the namespace; private caches use Moka's totals.
+    /// Results can change under concurrent writes. Disabled wrappers report zeroes.
+    pub fn cache_stats(&self) -> L1CacheStats {
+        if self.l1_enabled {
+            self.l1.stats()
+        } else {
+            L1CacheStats::default()
+        }
+    }
+
+    /// Access the underlying tokenizer (e.g. for downcasting to a concrete type).
+    pub fn inner(&self) -> &Arc<dyn Tokenizer> {
+        &self.inner
+    }
+}
+
+impl Encoder for CachedTokenizer {
+    fn encode(&self, input: &str) -> Result<Encoding> {
+        if !self.l1_enabled {
+            return self.inner.encode(input);
+        }
+
+        let matched = match self.l1.lookup_prefix(input) {
+            PrefixLookup::Hit(matched) => matched,
+            PrefixLookup::Miss(prefix_hashes) => {
+                let encoding = Encoding::Sp(self.l1.populate_and_encode_with_hashes(
+                    input,
+                    prefix_hashes.into_iter(),
+                    self.inner.as_ref(),
+                )?);
+                self.observe_token_usage(0, encoding.token_ids().len());
+                return Ok(encoding);
+            }
+        };
+
+        let cached_tokens = matched.tokens.len();
+        let encoding = if self.extend_on_hit {
+            Encoding::Sp(self.l1.extend_after_match_with_hash(
+                input,
+                matched,
+                self.inner.as_ref(),
+            )?)
+        } else {
+            let suffix_enc = self.inner.encode(&input[matched.prefix_len..])?;
+            // Reserve once to avoid copying the cached prefix during vector growth.
+            let mut merged: Vec<TokenIdType> =
+                Vec::with_capacity(matched.tokens.len() + suffix_enc.token_ids().len());
+            merged.extend_from_slice(&matched.tokens);
+            merged.extend_from_slice(suffix_enc.token_ids());
+            Encoding::Sp(merged)
+        };
+        self.observe_token_usage(cached_tokens, encoding.token_ids().len());
+        Ok(encoding)
+    }
+
+    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
+        // True passthrough when L1 is disabled — delegate to the inner's native
+        // batch path (which may be rayon-parallel for HF) instead of falling
+        // through per-item.
+        if !self.l1_enabled {
+            return self.inner.encode_batch(inputs);
+        }
+
+        // Per-item cache lookup — do NOT delegate to inner.encode_batch, which would
+        // bypass the cache. Sequential iteration is fine; if rayon is added later it
+        // belongs here, not inside `encode`.
+        inputs.iter().map(|&i| self.encode(i)).collect()
+    }
+
+    fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<Encoding> {
+        if !self.l1_enabled {
+            return self.inner.encode_segments(segments);
+        }
+
+        // Exactness assumes the inner tokenizer applies no truncation or padding to
+        // the joined ids (HF `post_process` and fastokens `encode_segments` do,
+        // whatever `add_special_tokens` says). Prefix caching relies on the same
+        // assumption; Dynamo strips both from HF tokenizers at load.
+        let mut ids: Vec<TokenIdType> = Vec::new();
+        let mut cached_tokens = 0;
+        let mut looked_up = false;
+        let mut hit = false;
+        let mut run_start = 0;
+        for (index, segment) in segments.iter().enumerate() {
+            if segment.text.len() < MIN_CACHED_SEGMENT_BYTES {
+                continue;
+            }
+            if run_start < index {
+                let run = self.inner.encode_segments(&segments[run_start..index])?;
+                ids.extend_from_slice(run.token_ids());
+            }
+            run_start = index + 1;
+            looked_up = true;
+            let key = self.l1.segment_key(segment.text, segment.allow_special);
+            if let Some(tokens) = self.l1.get(&key) {
+                hit = true;
+                cached_tokens += tokens.len();
+                ids.extend_from_slice(&tokens);
+            } else {
+                let encoding = self.inner.encode_segments(std::slice::from_ref(segment))?;
+                let tokens: Arc<[TokenIdType]> = encoding.token_ids().into();
+                ids.extend_from_slice(&tokens);
+                self.l1.insert(key, tokens);
+            }
+        }
+        if run_start < segments.len() {
+            let run = self.inner.encode_segments(&segments[run_start..])?;
+            ids.extend_from_slice(run.token_ids());
+        }
+        if looked_up {
+            self.l1.record_lookup(hit);
+        }
+        self.observe_token_usage(cached_tokens, ids.len());
+        Ok(Encoding::Sp(ids))
+    }
+}
+
+impl Decoder for CachedTokenizer {
+    fn has_unstable_suffix(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> bool {
+        self.inner
+            .has_unstable_suffix(token_ids, skip_special_tokens)
+    }
+
+    fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<DecodeResult> {
+        // Decode is not cached — passthrough to inner.
+        self.inner.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for CachedTokenizer {
+    fn vocab_size(&self) -> Option<usize> {
+        self.inner.vocab_size()
+    }
+
+    fn token_to_id(&self, token: &str) -> Result<Option<TokenIdType>> {
+        self.inner.token_to_id(token)
+    }
+
+    fn special_token_ids(&self) -> Result<Vec<TokenIdType>> {
+        self.inner.special_token_ids()
+    }
+
+    fn num_special_tokens_added(&self) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HuggingFaceTokenizer;
+    use std::sync::{Mutex, atomic::AtomicU64, atomic::Ordering};
+    use tokenizers::Tokenizer as HfTokenizer;
+
+    struct FailingTokenizer;
+
+    struct SegmentTokenizer;
+
+    impl Encoder for SegmentTokenizer {
+        fn encode(&self, input: &str) -> Result<Encoding> {
+            Ok(Encoding::Sp(vec![input.len() as u32]))
+        }
+
+        fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
+            inputs.iter().map(|input| self.encode(input)).collect()
+        }
+
+        fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<Encoding> {
+            let ids = segments
+                .iter()
+                .flat_map(|segment| [segment.allow_special as u32, segment.text.len() as u32])
+                .collect();
+            Ok(Encoding::Sp(ids))
+        }
+    }
+
+    impl Decoder for SegmentTokenizer {
+        fn decode(
+            &self,
+            _token_ids: &[TokenIdType],
+            _skip_special_tokens: bool,
+        ) -> Result<DecodeResult> {
+            Ok(DecodeResult::Complete(String::new()))
+        }
+    }
+
+    impl Tokenizer for SegmentTokenizer {
+        fn validate_prefix_cache(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Encoder for FailingTokenizer {
+        fn encode(&self, _input: &str) -> Result<Encoding> {
+            Err(anyhow::anyhow!("intentional encode failure"))
+        }
+
+        fn encode_batch(&self, _inputs: &[&str]) -> Result<Vec<Encoding>> {
+            Err(anyhow::anyhow!("intentional encode failure"))
+        }
+    }
+
+    impl Decoder for FailingTokenizer {
+        fn decode(
+            &self,
+            _token_ids: &[TokenIdType],
+            _skip_special_tokens: bool,
+        ) -> Result<DecodeResult> {
+            Err(anyhow::anyhow!("intentional decode failure"))
+        }
+    }
+
+    impl Tokenizer for FailingTokenizer {
+        fn validate_prefix_cache(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn vocab_size(&self) -> Option<usize> {
+            None
+        }
+    }
+
+    const TINYLLAMA_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/sample-models/TinyLlama_v1.1/tokenizer.json"
+    );
+
+    fn inner() -> Arc<dyn Tokenizer> {
+        Arc::new(HuggingFaceTokenizer::from_file(TINYLLAMA_PATH).expect("load TinyLlama"))
+    }
+
+    fn specials() -> Vec<String> {
+        vec!["<s>".into(), "</s>".into()]
+    }
+
+    fn collect_token_usage(
+        tokenizer: CachedTokenizer,
+    ) -> (CachedTokenizer, Arc<Mutex<Vec<CacheTokenUsage>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let tokenizer = tokenizer.with_token_observer(Arc::new(move |usage| {
+            observed.lock().unwrap().push(usage);
+        }));
+        (tokenizer, events)
+    }
+
+    #[test]
+    fn rejects_hf_tokenizer_that_adds_special_tokens() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            HuggingFaceTokenizer::from_file(TINYLLAMA_PATH)
+                .expect("load TinyLlama")
+                .with_options(crate::TokenizerOptions {
+                    add_special_tokens: true,
+                }),
+        );
+
+        let result = CachedTokenizer::new(tokenizer, specials(), 4096);
+        let Err(error) = result else {
+            panic!("add_special_tokens=true must be rejected");
+        };
+        assert_eq!(
+            error.to_string(),
+            "HuggingFace tokenizers configured with add_special_tokens=true must remain uncached"
+        );
+    }
+
+    #[test]
+    fn empty_specials_passes_through_correctly() {
+        // Empty token strings carry no boundary information and must not make L1 active.
+        let tok = inner();
+        let (cached, events) = collect_token_usage(
+            CachedTokenizer::new(tok.clone(), vec![String::new()], 4096)
+                .expect("TinyLlama must support prefix caching"),
+        );
+        let s = "<s>hello world</s>";
+        let a = cached.encode(s).unwrap();
+        let b = tok.encode(s).unwrap();
+        assert_eq!(a.token_ids(), b.token_ids());
+        let stats = cached.cache_stats();
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.misses, 0, "empty specials must not increment misses");
+        assert_eq!(stats.hits, 0);
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "empty specials must not emit token usage"
+        );
+    }
+
+    #[test]
+    fn laguna_overlapping_specials_bypass_cache() {
+        const TOKENIZER_JSON: &str = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {"id": 0, "content": "<unk>", "special": true, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false},
+                {"id": 2, "content": "〈|EOS|〉", "special": true, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false},
+                {"id": 14, "content": "〈|", "special": true, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false},
+                {"id": 15, "content": "|〉", "special": true, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<unk>": 0, "〈|EOS|〉": 2, "〈|": 14, "|〉": 15, "tail": 16},
+                "unk_token": "<unk>"
+            }
+        }"#;
+
+        let hf = HfTokenizer::from_bytes(TOKENIZER_JSON).expect("load test tokenizer");
+        let tok: Arc<dyn Tokenizer> = Arc::new(HuggingFaceTokenizer::from_tokenizer(hf));
+        let overlapping = vec!["〈|EOS|〉".into(), "〈|".into(), "|〉".into()];
+        let (cached, events) = collect_token_usage(
+            CachedTokenizer::new(tok.clone(), overlapping, 4096)
+                .expect("HuggingFace tokenizer must support prefix caching"),
+        );
+
+        let expected = tok.encode("〈|EOS|〉").unwrap();
+        assert_eq!(expected.token_ids(), &[2]);
+        assert_eq!(
+            cached.encode("〈|EOS|〉").unwrap().token_ids(),
+            expected.token_ids()
+        );
+        let stats = cached.cache_stats();
+        assert_eq!(stats.entries, 0);
+        assert_eq!(
+            stats.misses, 0,
+            "overlapping specials must not increment misses"
+        );
+        assert_eq!(stats.hits, 0);
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "overlapping specials must not emit token usage"
+        );
+    }
+
+    /// `text` repeated past the segment-caching threshold.
+    fn long_text(text: &str) -> String {
+        text.repeat(MIN_CACHED_SEGMENT_BYTES / text.len() + 1)
+    }
+
+    #[test]
+    fn segmented_encoding_without_specials_passes_through() {
+        let inner: Arc<dyn Tokenizer> = Arc::new(SegmentTokenizer);
+        let user = long_text("user content ");
+        let segments = [
+            EncodeSegment::new("<ctl>", true),
+            EncodeSegment::new(&user, false),
+        ];
+        let expected = inner.encode_segments(&segments).unwrap();
+        let (cached, events) = collect_token_usage(
+            CachedTokenizer::new(inner, Vec::new(), 4096)
+                .expect("test tokenizer supports prefix caching"),
+        );
+
+        for _ in 0..2 {
+            let actual = cached.encode_segments(&segments).unwrap();
+            assert_eq!(actual.token_ids(), expected.token_ids());
+        }
+        let stats = cached.cache_stats();
+        assert_eq!((stats.entries, stats.hits, stats.misses), (0, 0, 0));
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn segmented_encoding_caches_long_segments_and_matches_inner() {
+        let inner: Arc<dyn Tokenizer> = Arc::new(SegmentTokenizer);
+        let user = long_text("user content ");
+        let tool = long_text("<ctl> tool output ");
+        // The same text with and without allow_special encodes differently, so the
+        // flag must be part of the key; short segments are encoded but never cached.
+        let segments = [
+            EncodeSegment::new("<ctl>", true),
+            EncodeSegment::new(&user, false),
+            EncodeSegment::new("<ctl>", true),
+            EncodeSegment::new("short", false),
+            EncodeSegment::new(&tool, false),
+            EncodeSegment::new(&tool, true),
+            EncodeSegment::new("<ctl>", true),
+        ];
+        let expected = inner.encode_segments(&segments).unwrap();
+        let (cached, events) = collect_token_usage(
+            CachedTokenizer::new(inner.clone(), vec!["<ctl>".to_string()], 4096)
+                .expect("test tokenizer supports prefix caching"),
+        );
+
+        let first = cached.encode_segments(&segments).unwrap();
+        let second = cached.encode_segments(&segments).unwrap();
+        assert_eq!(first.token_ids(), expected.token_ids());
+        assert_eq!(second.token_ids(), expected.token_ids());
+
+        let stats = cached.cache_stats();
+        assert_eq!(stats.entries, 3);
+        assert_eq!((stats.hits, stats.misses), (1, 1));
+        // The mock encodes each segment as two ids, so the three long segments are six.
+        let total = expected.token_ids().len();
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[
+                CacheTokenUsage {
+                    cached_tokens: 0,
+                    uncached_tokens: total,
+                },
+                CacheTokenUsage {
+                    cached_tokens: 6,
+                    uncached_tokens: total - 6,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn segment_entries_do_not_collide_with_prefix_entries() {
+        let inner: Arc<dyn Tokenizer> = Arc::new(SegmentTokenizer);
+        let cached = CachedTokenizer::new(inner.clone(), vec!["<ctl>".to_string()], 4096)
+            .expect("test tokenizer supports prefix caching");
+        // `encode` caches the prefix ending at "<ctl>"; a segment with the same text must
+        // still get the segment encoding, not the prefix entry's tokens.
+        let text = long_text("prefix text ") + "<ctl>";
+        cached.encode(&(text.clone() + " suffix")).unwrap();
+        for allow_special in [false, true] {
+            let segment = [EncodeSegment::new(&text, allow_special)];
+            for _ in 0..2 {
+                assert_eq!(
+                    cached.encode_segments(&segment).unwrap().token_ids(),
+                    inner.encode_segments(&segment).unwrap().token_ids()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn token_observer_reports_full_miss_and_partial_hit_with_and_without_extension() {
+        for extend_on_hit in [false, true] {
+            let tok = inner();
+            let hits = Arc::new(AtomicU64::new(0));
+            let misses = Arc::new(AtomicU64::new(0));
+            let hit_counter = hits.clone();
+            let miss_counter = misses.clone();
+            let cached = CachedTokenizer::new(tok, specials(), 64 * 1024)
+                .expect("TinyLlama must support prefix caching")
+                .with_extend(extend_on_hit)
+                .with_observer(
+                    Arc::new(move || {
+                        hit_counter.fetch_add(1, Ordering::Relaxed);
+                    }),
+                    Arc::new(move || {
+                        miss_counter.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            let (cached, events) = collect_token_usage(cached);
+
+            let shared = "<s>system\nYou are helpful.</s><s>user\n";
+            let first = format!("{shared}First question?</s>");
+            let second = format!("{shared}Second different prompt entirely.</s>");
+
+            let first_encoding = cached.encode(&first).unwrap();
+            let second_encoding = cached.encode(&second).unwrap();
+
+            let events = events.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(
+                events[0],
+                CacheTokenUsage {
+                    cached_tokens: 0,
+                    uncached_tokens: first_encoding.token_ids().len(),
+                }
+            );
+            assert!(events[1].cached_tokens > 0);
+            assert!(events[1].uncached_tokens > 0);
+            assert_eq!(
+                events[1].cached_tokens + events[1].uncached_tokens,
+                second_encoding.token_ids().len()
+            );
+            assert_eq!(hits.load(Ordering::Relaxed), 1);
+            assert_eq!(misses.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn token_observer_does_not_report_failed_encodes() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(FailingTokenizer);
+        let (cached, events) = collect_token_usage(
+            CachedTokenizer::new(tokenizer, specials(), 4096)
+                .expect("test tokenizer explicitly supports prefix caching"),
+        );
+
+        assert!(cached.encode("<s>this fails</s>").is_err());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn two_turn_chat_correctness_and_hit() {
+        let tok = inner();
+        let cached = CachedTokenizer::new(tok.clone(), specials(), 64 * 1024)
+            .expect("TinyLlama must support prefix caching");
+
+        let template = "<s>system\nYou are helpful.</s><s>user\n";
+        let first = format!("{template}First question?</s>");
+        let second = format!("{template}Second different prompt entirely.</s>");
+
+        // Warm the cache.
+        let _ = cached.encode(&first).unwrap();
+
+        // Second request: shared prefix → L1 hit, suffix-only fresh encode.
+        let cached_second = cached.encode(&second).unwrap();
+        let plain_second = tok.encode(&second).unwrap();
+        assert_eq!(
+            cached_second.token_ids(),
+            plain_second.token_ids(),
+            "cached encode must equal plain encode for second turn"
+        );
+
+        let stats = cached.cache_stats();
+        assert!(stats.hits >= 1, "expected L1 hit on second request");
+    }
+
+    #[test]
+    fn decode_passes_through() {
+        let tok = inner();
+        let cached = CachedTokenizer::new(tok.clone(), specials(), 4096)
+            .expect("TinyLlama must support prefix caching");
+        let enc = cached.encode("<s>hello</s>").unwrap();
+        let direct = tok.decode(enc.token_ids(), false).unwrap();
+        let through = cached.decode(enc.token_ids(), false).unwrap();
+        assert_eq!(direct, through);
+    }
+
+    #[test]
+    fn encode_batch_uses_cache() {
+        let tok = inner();
+        let (cached, events) = collect_token_usage(
+            CachedTokenizer::new(tok.clone(), specials(), 64 * 1024)
+                .expect("TinyLlama must support prefix caching"),
+        );
+        let shared = "<s>system\nShared persona.</s><s>user\n";
+        let inputs = [
+            format!("{shared}q1</s>"),
+            format!("{shared}q2</s>"),
+            format!("{shared}q3</s>"),
+        ];
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let outs = cached.encode_batch(&refs).unwrap();
+        assert_eq!(outs.len(), 3);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), outs.len());
+        for (event, output) in events.iter().zip(&outs) {
+            assert_eq!(
+                event.cached_tokens + event.uncached_tokens,
+                output.token_ids().len()
+            );
+        }
+        assert_eq!(events[0].cached_tokens, 0);
+        assert!(events[1..].iter().all(|event| event.cached_tokens > 0));
+        // First call populates, second/third hit.
+        assert!(cached.cache_stats().hits >= 2, "expected hits on q2 and q3");
+    }
+
+    #[test]
+    fn vocab_introspection_forwards_to_inner() {
+        let tok = inner();
+        let cached = CachedTokenizer::new(tok.clone(), specials(), 4096)
+            .expect("TinyLlama must support prefix caching");
+        assert_eq!(cached.vocab_size(), tok.vocab_size());
+        assert_eq!(
+            cached.token_to_id("<s>").unwrap(),
+            tok.token_to_id("<s>").unwrap()
+        );
+        assert_eq!(
+            cached.special_token_ids().unwrap(),
+            tok.special_token_ids().unwrap()
+        );
+    }
+
+    #[test]
+    fn special_token_accounting_matches_cached_encoder_behavior() {
+        let cached = CachedTokenizer::new(inner(), specials(), 4096)
+            .expect("TinyLlama must support prefix caching")
+            .with_options(crate::TokenizerOptions {
+                add_special_tokens: true,
+            });
+        let cached_ids = cached.encode("hello").unwrap();
+        let hf_ids = HuggingFaceTokenizer::from_file(TINYLLAMA_PATH)
+            .expect("load TinyLlama")
+            .with_options(crate::TokenizerOptions {
+                add_special_tokens: true,
+            })
+            .encode("hello")
+            .unwrap();
+
+        assert_eq!(cached.num_special_tokens_added().unwrap(), 0);
+        assert_eq!(hf_ids.token_ids().len(), cached_ids.token_ids().len() + 1);
+        assert_eq!(&hf_ids.token_ids()[1..], cached_ids.token_ids());
+    }
+
+    #[test]
+    fn unoverridden_introspection_methods_use_defaults() {
+        let tokenizer = SegmentTokenizer;
+        assert_eq!(tokenizer.vocab_size(), None);
+        assert!(tokenizer.token_to_id("anything").is_err());
+        assert!(tokenizer.special_token_ids().is_err());
+        assert!(tokenizer.num_special_tokens_added().is_err());
+    }
+}
